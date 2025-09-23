@@ -37,17 +37,18 @@ import {
   UpdateKeyNotFoundError,
 } from "./errors"
 import { CollectionEvents } from "./collection-events.js"
+import { currentStateAsChanges } from "./change-events"
+import { CollectionSubscription } from "./collection-subscription.js"
 import type {
   AllCollectionEvents,
   CollectionEventHandler,
 } from "./collection-events.js"
-import { currentStateAsChanges } from "./change-events"
-import { CollectionSubscription } from "./collection-subscription.js"
 import type { Transaction } from "./transactions"
 import type { StandardSchemaV1 } from "@standard-schema/spec"
 import type { SingleRowRefProxy } from "./query/builder/ref-proxy"
 import type {
   ChangeMessage,
+  CleanupFn,
   CollectionConfig,
   CollectionStatus,
   CurrentStateAsChangesOptions,
@@ -55,11 +56,13 @@ import type {
   InferSchemaInput,
   InferSchemaOutput,
   InsertConfig,
+  OnLoadMoreOptions,
   OperationConfig,
   OptimisticChangeMessage,
   PendingMutation,
   StandardSchema,
   SubscribeChangesOptions,
+  SyncConfigRes,
   Transaction as TransactionType,
   TransactionWithMutations,
   UtilsRecord,
@@ -266,6 +269,9 @@ export class CollectionImpl<
   private gcTimeoutId: ReturnType<typeof setTimeout> | null = null
   private preloadPromise: Promise<void> | null = null
   private syncCleanupFn: (() => void) | null = null
+  private syncOnLoadMoreFn:
+    | ((options: OnLoadMoreOptions) => void | Promise<void>)
+    | null = null
 
   // Event system
   private events: CollectionEvents
@@ -488,106 +494,111 @@ export class CollectionImpl<
     this.setStatus(`loading`)
 
     try {
-      const cleanupFn = this.config.sync.sync({
-        collection: this,
-        begin: () => {
-          this.pendingSyncedTransactions.push({
-            committed: false,
-            operations: [],
-            deletedKeys: new Set(),
-          })
-        },
-        write: (messageWithoutKey: Omit<ChangeMessage<TOutput>, `key`>) => {
-          const pendingTransaction =
-            this.pendingSyncedTransactions[
-              this.pendingSyncedTransactions.length - 1
-            ]
-          if (!pendingTransaction) {
-            throw new NoPendingSyncTransactionWriteError()
-          }
-          if (pendingTransaction.committed) {
-            throw new SyncTransactionAlreadyCommittedWriteError()
-          }
-          const key = this.getKeyFromItem(messageWithoutKey.value)
-
-          // Check if an item with this key already exists when inserting
-          if (messageWithoutKey.type === `insert`) {
-            const insertingIntoExistingSynced = this.syncedData.has(key)
-            const hasPendingDeleteForKey =
-              pendingTransaction.deletedKeys.has(key)
-            const isTruncateTransaction = pendingTransaction.truncate === true
-            // Allow insert after truncate in the same transaction even if it existed in syncedData
-            if (
-              insertingIntoExistingSynced &&
-              !hasPendingDeleteForKey &&
-              !isTruncateTransaction
-            ) {
-              throw new DuplicateKeySyncError(key, this.id)
+      const syncRes = normalizeSyncFnResult(
+        this.config.sync.sync({
+          collection: this,
+          begin: () => {
+            this.pendingSyncedTransactions.push({
+              committed: false,
+              operations: [],
+              deletedKeys: new Set(),
+            })
+          },
+          write: (messageWithoutKey: Omit<ChangeMessage<TOutput>, `key`>) => {
+            const pendingTransaction =
+              this.pendingSyncedTransactions[
+                this.pendingSyncedTransactions.length - 1
+              ]
+            if (!pendingTransaction) {
+              throw new NoPendingSyncTransactionWriteError()
             }
-          }
+            if (pendingTransaction.committed) {
+              throw new SyncTransactionAlreadyCommittedWriteError()
+            }
+            const key = this.getKeyFromItem(messageWithoutKey.value)
 
-          const message: ChangeMessage<TOutput> = {
-            ...messageWithoutKey,
-            key,
-          }
-          pendingTransaction.operations.push(message)
+            // Check if an item with this key already exists when inserting
+            if (messageWithoutKey.type === `insert`) {
+              const insertingIntoExistingSynced = this.syncedData.has(key)
+              const hasPendingDeleteForKey =
+                pendingTransaction.deletedKeys.has(key)
+              const isTruncateTransaction = pendingTransaction.truncate === true
+              // Allow insert after truncate in the same transaction even if it existed in syncedData
+              if (
+                insertingIntoExistingSynced &&
+                !hasPendingDeleteForKey &&
+                !isTruncateTransaction
+              ) {
+                throw new DuplicateKeySyncError(key, this.id)
+              }
+            }
 
-          if (messageWithoutKey.type === `delete`) {
-            pendingTransaction.deletedKeys.add(key)
-          }
-        },
-        commit: () => {
-          const pendingTransaction =
-            this.pendingSyncedTransactions[
-              this.pendingSyncedTransactions.length - 1
-            ]
-          if (!pendingTransaction) {
-            throw new NoPendingSyncTransactionCommitError()
-          }
-          if (pendingTransaction.committed) {
-            throw new SyncTransactionAlreadyCommittedError()
-          }
+            const message: ChangeMessage<TOutput> = {
+              ...messageWithoutKey,
+              key,
+            }
+            pendingTransaction.operations.push(message)
 
-          pendingTransaction.committed = true
+            if (messageWithoutKey.type === `delete`) {
+              pendingTransaction.deletedKeys.add(key)
+            }
+          },
+          commit: () => {
+            const pendingTransaction =
+              this.pendingSyncedTransactions[
+                this.pendingSyncedTransactions.length - 1
+              ]
+            if (!pendingTransaction) {
+              throw new NoPendingSyncTransactionCommitError()
+            }
+            if (pendingTransaction.committed) {
+              throw new SyncTransactionAlreadyCommittedError()
+            }
 
-          // Update status to initialCommit when transitioning from loading
-          // This indicates we're in the process of committing the first transaction
-          if (this._status === `loading`) {
-            this.setStatus(`initialCommit`)
-          }
+            pendingTransaction.committed = true
 
-          this.commitPendingTransactions()
-        },
-        markReady: () => {
-          this.markReady()
-        },
-        truncate: () => {
-          const pendingTransaction =
-            this.pendingSyncedTransactions[
-              this.pendingSyncedTransactions.length - 1
-            ]
-          if (!pendingTransaction) {
-            throw new NoPendingSyncTransactionWriteError()
-          }
-          if (pendingTransaction.committed) {
-            throw new SyncTransactionAlreadyCommittedWriteError()
-          }
+            // Update status to initialCommit when transitioning from loading
+            // This indicates we're in the process of committing the first transaction
+            if (this._status === `loading`) {
+              this.setStatus(`initialCommit`)
+            }
 
-          // Clear all operations from the current transaction
-          pendingTransaction.operations = []
-          pendingTransaction.deletedKeys.clear()
+            this.commitPendingTransactions()
+          },
+          markReady: () => {
+            this.markReady()
+          },
+          truncate: () => {
+            const pendingTransaction =
+              this.pendingSyncedTransactions[
+                this.pendingSyncedTransactions.length - 1
+              ]
+            if (!pendingTransaction) {
+              throw new NoPendingSyncTransactionWriteError()
+            }
+            if (pendingTransaction.committed) {
+              throw new SyncTransactionAlreadyCommittedWriteError()
+            }
 
-          // Mark the transaction as a truncate operation. During commit, this triggers:
-          // - Delete events for all previously synced keys (excluding optimistic-deleted keys)
-          // - Clearing of syncedData/syncedMetadata
-          // - Subsequent synced ops applied on the fresh base
-          // - Finally, optimistic mutations re-applied on top (single batch)
-          pendingTransaction.truncate = true
-        },
-      })
+            // Clear all operations from the current transaction
+            pendingTransaction.operations = []
+            pendingTransaction.deletedKeys.clear()
+
+            // Mark the transaction as a truncate operation. During commit, this triggers:
+            // - Delete events for all previously synced keys (excluding optimistic-deleted keys)
+            // - Clearing of syncedData/syncedMetadata
+            // - Subsequent synced ops applied on the fresh base
+            // - Finally, optimistic mutations re-applied on top (single batch)
+            pendingTransaction.truncate = true
+          },
+        })
+      )
 
       // Store cleanup function if provided
-      this.syncCleanupFn = typeof cleanupFn === `function` ? cleanupFn : null
+      this.syncCleanupFn = syncRes?.cleanup ?? null
+
+      // Store onLoadMore function if provided
+      this.syncOnLoadMoreFn = syncRes?.onLoadMore ?? null
     } catch (error) {
       this.setStatus(`error`)
       throw error
@@ -631,6 +642,18 @@ export class CollectionImpl<
     })
 
     return this.preloadPromise
+  }
+
+  /**
+   * Requests the sync layer to load more data.
+   * @param options Options to control what data is being loaded
+   * @returns If data loading is asynchronous, this method returns a promise that resolves when the data is loaded.
+   *          If data loading is synchronous, the data is loaded when the method returns.
+   */
+  public syncMore(options: OnLoadMoreOptions): void | Promise<void> {
+    if (this.syncOnLoadMoreFn) {
+      return this.syncOnLoadMoreFn(options)
+    }
   }
 
   /**
@@ -2477,4 +2500,16 @@ export class CollectionImpl<
   ) {
     return this.events.waitFor(event, timeout)
   }
+}
+
+function normalizeSyncFnResult(result: void | CleanupFn | SyncConfigRes) {
+  if (typeof result === `function`) {
+    return { cleanup: result }
+  }
+
+  if (typeof result === `object`) {
+    return result
+  }
+
+  return undefined
 }
